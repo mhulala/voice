@@ -1,0 +1,1477 @@
+#!/usr/bin/perl -w
+
+{
+  package cgiSTDERR;
+
+  use strict;
+  no  strict 'refs';
+  use warnings;
+
+  use Fcntl ':flock';
+  use POSIX qw ( strftime );
+  use Time::HiRes;
+
+  use constant file_operation_timeout => 10; # seconds
+
+  my ($file, $counter, $LF, $buffer);
+
+  sub timestamp
+  {
+    my ($seconds, $microseconds) = Time::HiRes::gettimeofday;
+    return sprintf('%s.%06d', POSIX::strftime('%Y-%m-%d %H:%M:%S', gmtime($seconds)), $microseconds);
+  }
+
+  sub TIEHANDLE
+  {
+    no strict 'vars';
+    ($package, $file) = @_;
+    ($counter, $LF, $buffer) = (0, 0, '');
+    return bless [], $package;
+  }
+
+  sub PRINT
+  {
+    shift;
+    $_ = @_ ? join('', map { s/(?:,\s+)?\<STDIN\>\s+line\s+[0-9]+(\.?)$/$1/r } @_) : '';
+    return if /^$/;
+    $counter++;
+    $buffer .= sprintf('[%s]  %-18s  ', &timestamp(), $ENV{'SCRIPT_NAME'}) if !/^\[\d{4}-\d{2}-\d{2}\s\d{2}:\d{2}:\d{2}\.\d{6}\]\s{2}(?:ERROR|FATAL)/;
+    $buffer .= $_ =~ s/\s*,\s+<DATA>\s+line\s+\d+\.$//r =~ s/\r+//gr =~ s/\n(?=.)/{ "\n" . " " x 50 }/ger;
+    $LF = +grep { length($_) } (join('', @_) =~ s/\r+//gr =~ s/[^\n]+/*/gr =~ s/^$/{ "\n" x $LF }/er =~ /(\n?)(\n)$/);
+  }
+
+  sub OPEN
+  {
+    no strict 'vars';
+    ($file, $counter, $LF, $buffer) = (shift, 0, 0, '');
+  }
+
+  sub CLOSE
+  {
+    return if !defined $file || !defined $buffer || $buffer =~ /^$/;
+    eval
+    {
+      local $SIG{ALRM} = sub { CORE::die "File operation timed out\n" };
+      eval
+      {
+        no strict 'subs';
+        no warnings 'numeric';
+        alarm(file_operation_timeout);
+        CORE::die 'File operation failed (open)'    . "\n" unless open(my $fh, '>>', $file);
+        CORE::die 'File operation failed (binmode)' . "\n" unless binmode($fh, ':utf8');   
+        CORE::die 'File operation failed (flock)'   . "\n" if    !flock  ($fh, LOCK_EX);
+        print $fh $buffer;
+        print $fh "\n" x (2 - $LF) if $counter > 0 && $LF < 2;
+        flock($fh, LOCK_UN);
+        close $fh;
+      };
+      # ignore $@;
+      alarm(0);
+    };
+    # ignore $@;
+    ($counter, $LF, $buffer) = (0, 0, '');
+  }
+
+  END
+  {
+    CLOSE;
+  }
+}
+
+{
+  package cgiSTDOUT;
+
+  use strict;
+  no  strict 'refs';
+  use warnings;
+
+  my $STDOUT;
+  my ($buffer, $valid) = ('', 0);
+
+  sub TIEHANDLE
+  {
+    return bless [], shift;
+  }
+
+  sub PRINT
+  {
+    return if !defined $STDOUT;
+    shift;
+    eval
+    {
+      if ($valid == 1)
+      {
+        print $STDOUT @_;
+        return;
+      }
+      $buffer .= join('', @_) if $valid != 1;
+      if ($valid == 0)
+      {
+        if ($buffer =~ /^(.*?)(?:\r?\n){2}/s)
+        {
+          $_ = defined $1 ? $1 : '';
+          $valid = /^(?:Content-Type|Location|Status):/im ? 1 : -1;
+        }
+        print $STDOUT $buffer if $valid == 1;
+        $buffer = '' if $valid == 1;
+      }
+    };
+  }
+
+  sub init
+  {
+    tie *PRINTOUT, 'cgiSTDOUT';
+    $STDOUT = select(*PRINTOUT);
+  }
+
+  sub dump
+  {
+    return '' if !@_ || +grep { ref \$_ ne 'SCALAR' } @_;
+    return join('', @_) =~ s/^/>  /gmr;
+  }
+
+  END
+  {
+    return if !defined $STDOUT;
+    eval
+    {
+      if (($valid // 0) != 1)
+      {
+        print $STDOUT "Status: 503\nContent-Type: text/plain\n\nService Unavailable";
+        print  STDERR "End of script output before headers\n";
+        print  STDERR "\n" . &dump($buffer =~ s/(?:^[\s\n\r]+|[\s\n\r]+$)//gr) . "\n\n" if ($buffer !~ /^\s*$/);
+      }
+    };
+  }
+}
+
+package main;
+
+use strict;
+use warnings;
+
+no if ($] >= 5.018), 'warnings' => 'experimental';
+
+use feature 'switch';
+
+binmode(STDIN , ':raw' );
+binmode(STDOUT, ':utf8');
+binmode(STDERR, ':utf8');
+
+use CGI                              qw ( :standard );
+use Date::WeekNumber                 qw ( iso_week_number );
+use DateTime;
+use DateTime::Format::Strptime       qw ( );
+use DBD::mysql;
+use DBI;
+use Email::Valid;
+use Encode;
+use Fcntl                            qw ( :flock );
+use IO::Scalar;
+use IPC::Run3;
+use JSON                             qw ( encode_json decode_json );
+use List::Util                       qw ( pairmap );
+use LWP::UserAgent;
+use MIME::Base64                     qw ( encode_base64 decode_base64 );
+use POSIX                            qw ( strftime );
+use Time::HiRes;
+use Time::Piece;                     sub strptime { return Time::Piece->strptime(@_); }
+use URI::Encode;
+
+use constant file_operation_timeout  => 10; # seconds
+use constant  sql_operation_timeout  => 10; # seconds
+use constant  web_operation_timeout  => 15; # seconds
+
+use constant maximum_attachment_size => 2*1024*1024; # 2 MB
+
+use constant template_variables      => qw ( FULLNAME FIRSTNAME FROM TO CALLED DATETIME YEAR MEDIA_URL );
+
+use constant web_agent               => 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/104.0.0.0 Safari/537.36';
+
+use constant http_200_response       => 'OK';
+use constant http_403_response       => 'Forbidden';
+use constant http_405_response       => 'Method Not Allowed';
+
+use constant mysql_database          => '##########';
+use constant mysql_username          => '##########';
+use constant mysql_password          => '##########';
+
+use constant log_file_path           => '/var/www/vhosts/##########';
+use constant log_file_name           => '.voice.log.%W.txt'; # %W replaced by ISO 8601 week number
+
+use constant err_file_path           => '/var/www/vhosts/##########';
+use constant err_file_name           => '.error.log.%W.txt'; # %W replaced by ISO 8601 week number
+
+use constant ms_graph_email_address  => '##########';
+use constant ms_graph_client_id      => '##########';
+use constant ms_graph_client_secret  => '##########';
+use constant ms_graph_scope_url      => 'https://graph.microsoft.com/.default';
+use constant ms_graph_get_token_url  => 'https://login.microsoftonline.com/##########/oauth2/v2.0/token';
+use constant ms_graph_send_mail_url  => 'https://graph.microsoft.com/v1.0/users/##########/sendmail';
+
+#-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------#
+
+$ENV{'PERL_LWP_SSL_VERIFY_HOSTNAME'} = 0;
+
+my $main_data;
+{
+  local $/;
+  $_ = <main::DATA>;
+  s/(?:\A\s+|\s+\Z)//gs;
+  s/^\s*(@\S+)\s*(?=\n)/$1/gsm;
+  foreach (split(/\n+(?=@\S+\n)/)) { $main_data->{$1} = "$3$2" if /\A@(\S+)(?=\n|\Z)(\n?)(.*)\Z/s; }
+}
+
+sub timestamp
+{
+  my ($seconds, $microseconds) = Time::HiRes::gettimeofday;
+  return sprintf('%s.%06d', POSIX::strftime('%Y-%m-%d %H:%M:%S', gmtime($seconds)), $microseconds);
+}
+
+my ($cgi, $cgi_raw, $cgi_method, $dbh);
+
+my $log = '';
+my $date_recorded = time();
+
+BEGIN
+{
+  $cgi_raw = '';
+  if (!(-t STDIN))
+  {
+    STDIN->blocking(defined $ENV{GATEWAY_INTERFACE});
+    {
+      no strict 'vars';
+      local $/; 
+      local $s;
+      $cgi_raw = <STDIN>;
+      tie  *STDIN, 'IO::Scalar', \$s;
+      print STDIN $cgi_raw;
+      tied(*STDIN)->setpos(0);
+    }
+  }
+}
+
+$SIG{__DIE__} = sub 
+{
+  CORE::die @_;
+};
+
+END
+{
+  return if !defined $log || $log =~ /^$/;
+  my $file = (log_file_path =~ s/\/+$/\//r) . 
+             (log_file_name =~ s/\%W/{ iso_week_number($date_recorded) }/egr);
+  eval
+  {
+    local $SIG{ALRM} = sub { CORE::die "File operation timed out\n" };
+    eval
+    {
+      no strict 'subs';
+      no warnings 'numeric';
+      alarm(file_operation_timeout);
+      CORE::die 'File operation failed (open)'    . "\n" unless open(my $fh, '>>', $file);
+      CORE::die 'File operation failed (binmode)' . "\n" unless binmode($fh, ':utf8');   
+      CORE::die 'File operation failed (flock)'   . "\n" if    !flock  ($fh, LOCK_EX);
+      print $fh $log;
+      flock($fh, LOCK_UN);
+      close $fh;
+    };
+    print STDERR 'Unable to write to the application log file - ' . $@ . "\n" if $@;
+    alarm(0);
+  };
+  print STDERR 'Unable to write to the application log file - ' . $@ . "\n" if $@;
+}
+
+sub tieSTDERR
+{
+  tie *STDERR, 'cgiSTDERR', (err_file_path =~ s/\/+$/\//r) . (err_file_name =~ s/\%W/{ iso_week_number($date_recorded) }/egr);
+}
+
+sub log
+{
+  return undef if $#_ < 1 || +grep { ref \$_ ne 'SCALAR' } @_;
+  $log .= sprintf('[%s]  %-18s  ', &timestamp(), shift) . join(' | ', grep { defined $_ } @_)  . "\n";
+}
+
+sub err
+{
+  return undef if $#_ < 1 || +grep { ref \$_ ne 'SCALAR' } @_;
+  $_ = sprintf('[%s]  %-18s  ', &timestamp(), 'ERROR' . ($_[0] =~ /^\d+$/ ? ' (line ' . shift . ')' : '')) . join(' | ', grep { defined $_ } @_)  . "\n";
+  $log .= $_;
+  print STDERR $_;
+  eval { $dbh->disconnect() } if defined $dbh;
+  exit 1;
+}
+
+sub die
+{
+  return undef if $#_ < 1 || +grep { ref \$_ ne 'SCALAR' } @_;
+  $_ = sprintf('[%s]  %-18s  ', &timestamp(), 'FATAL' . ($_[0] =~ /^\d+$/ ? ' (line ' . shift . ')' : '')) . join(' | ', grep { defined $_ } @_)  . "\n";
+  $log .= $_;
+  print STDERR $_;
+  eval { $dbh->disconnect() } if defined $dbh;
+  exit -1;
+}
+
+sub cgi_header
+{
+  return (!($#_ ~~ [0..2]) || ref \$_[0] ne 'SCALAR' || ($#_ > 0 && ref \$_[1] ne 'SCALAR') || ($#_ > 1 && ref $_[2] ne 'ARRAY')) ?
+    '' : header(('-status', shift, '-type', shift // 'text/plain; charset=UTF-8', @_ ? @{+shift} : ()));
+}
+
+sub mimeTypeExtenstion
+{
+  my $mimeType = shift;
+  return $mimeType ~~ ['audio/mpeg']                                 ? '.mp3'  :
+         $mimeType ~~ ['audio/wav',  'audio/wave',   'audio/x-wav' ] ? '.wav'  :
+         $mimeType ~~ ['audio/aiff', 'audio/x-aifc', 'audio/x-aiff'] ? '.aif'  :
+         $mimeType ~~ ['audio/gsm',  'audio/x-gsm'                 ] ? '.gsm'  :
+         $mimeType ~~ ['audio/ulaw'                                ] ? '.ulaw' : undef;
+}
+
+sub http_request
+{
+  my ($method, $uri) = (shift, shift);
+  return undef if !defined $uri || (defined $_[0] && ref $_[0] ne 'ARRAY');
+  my $headers = shift // [];
+  return undef if $#_ == 0 && (ref $_[0] ne 'ARRAY' && ref \$_[0] ne 'SCALAR');
+  return undef if $#_  > 0 && +grep { ref \$_ ne 'SCALAR' } @_;
+  my @data = @_ && ref $_[0] eq 'ARRAY' ? @{+shift} : $#_ < 1 ? (shift // '') : $#_ % 2 == 1 ? @_ : (@_, '');
+  return undef if +grep { ref \$_ ne 'SCALAR' } @data;
+  my $encoder = URI::Encode->new({ encode_reserved => 1 });
+  my $content = $#data < 1 ? $data[0] : join('&', pairmap { $encoder->encode($a) . '=' . $encoder->encode($b) } @data);
+  HTTP::Request->new($method, $uri, $headers, $content);
+}
+
+sub regex_replace
+{
+  my ($string, $pattern, $replacement) = @_;
+  $replacement = '"' . $replacement =~ s/\$([1-9&])/\$\{$1\}/gr =~ s/^(?=.*(?:\$\{[^1-9&]\}|\@|\%)).*$//r =~ s/\"/\\"/gr . '"';
+  eval { $string =~ s/$pattern/$replacement/eeg };
+  return $string;
+}
+
+sub template_var_replace
+{
+  my @names = @{+shift};
+  my %var = %{+shift};
+  my @p = split(/\|/, ($_[0] // ''), -1);
+  return '' if $#p < 1 || $#p > 2;
+  push(@p, '') if ($#p == 1);
+  return (!defined $var{$p[0]} || $var{$p[0]} =~ /^\s*$/) ? $p[2] : $p[1] =~ s/\$\$/{ $var{$p[0]} }/egr;
+}
+
+&tieSTDERR();
+
+STDOUT->autoflush(1);
+STDERR->autoflush(1);
+
+$cgi = CGI->new();
+$cgi_method = ($cgi->request_method() // '') =~ tr/a-z/A-Z/r =~ s/(?:^\s+|\s+$|[\n\r]+)//gr;
+
+if ((-t STDIN) || ($cgi_method =~ /^$/))
+{
+  # not an HTTP request
+  exit 0;
+}
+
+cgiSTDOUT::init();
+
+if ($cgi_method !~ /^(?:GET|POST)$/)
+{
+  print &cgi_header(405, 'text/plain; charset=UTF-8', [ 'Allow' => 'GET, POST' ]) . http_405_response;
+  &log('ERROR', 'Web Client | Method "' . $cgi_method . '" not allowed');
+  exit 1;
+}
+
+my @url_params = defined $cgi->url_param() ? $cgi->url_param() : ();
+   @url_params = split(/&/, $ENV{QUERY_STRING}) if !$#url_params;
+
+if ($cgi_method =~ /^GET$/)
+{
+  if (!(!$#url_params && $url_params[0] =~ /^([0-9a-f]+[-])*[0-9a-f]+$/i && ($cgi->url_param($url_params[0]) // '') =~ /^$/))
+  {
+    print &cgi_header(403, 'text/plain; charset=UTF-8') . http_403_response;
+    &log('ERROR', 'Web Client | Invalid GET parameter(s)');
+    exit 1;
+  }
+
+  if ($url_params[0] =~ /\-/)
+  {
+    # audio greeting
+
+    $dbh = DBI->connect('DBI:mysql:' . mysql_database, mysql_username, mysql_password, { RaiseError => 0, AutoCommit => 1 })
+      or &err(__LINE__, 'SQL Server | ' . DBI->errstr());
+
+    my (
+         $sth,
+         $rows,
+         $voicemailGreetingAudioMedia,
+         $voicemailGreetingAudioMediaMimeType
+       );
+
+    eval
+    {
+      local $SIG{ALRM} = sub { &die(__LINE__, "SQL operation timed out."); };
+      eval
+      {
+        alarm(sql_operation_timeout);
+
+        $sth = $dbh->prepare($main_data->{'sql_voicemail_greeting'} =~ s/\s+/ /gr)
+          or &err(__LINE__, 'SQL Server | ' . DBI->errstr());
+
+        $sth->execute
+          (
+            $url_params[0]
+          )
+          or &err(__LINE__, 'SQL Server | ' . DBI->errstr());
+
+        $rows = $sth->rows;
+
+        (
+          $voicemailGreetingAudioMedia,
+          $voicemailGreetingAudioMediaMimeType
+        )
+        = $sth->fetchrow_array();
+
+        $sth->finish;
+      };
+
+      &err(__LINE__, 'SQL Server' . (($@ !~ /^$/) ? " | $@" : '')) if $@;
+      alarm(0);
+    };
+
+    &err(__LINE__, 'SQL Server' . (($@ !~ /^$/) ? " | $@" : '')) if $@;
+
+    eval { $dbh->disconnect() } if defined $dbh;
+
+    if ($rows == 0)
+    {
+      print &cgi_header(403, 'text/plain; charset=UTF-8') . http_403_response;
+      &log('ERROR', 'Web Client | URL query parameter(s) mismatch - ' . $url_params[0]);
+      exit 1;
+    }
+
+    my $audio = decode_base64($voicemailGreetingAudioMedia);
+
+    {
+      use bytes;
+      binmode(STDOUT, ':raw');
+      print &cgi_header(200, $voicemailGreetingAudioMediaMimeType . '; charset=ASCII', [ 'Content-Length' => length($audio) ]) . $audio;
+    }
+
+    &log('VOICE', 'Web Client | Audio greeting retrieval (' . $url_params[0] . ')');
+
+    exit 0;
+  }
+  else
+  {
+    # voicemail recording
+
+    $dbh = DBI->connect('DBI:mysql:' . mysql_database, mysql_username, mysql_password, { RaiseError => 0, AutoCommit => 1 })
+      or &err(__LINE__, 'SQL Server | ' . DBI->errstr());
+
+    my (
+         $sth,
+         $rows,
+
+         $recordingMedia,
+         $recordingMediaName,
+         $recordingMediaMimeType
+       );
+
+    eval
+    {
+      local $SIG{ALRM} = sub { &die(__LINE__, "SQL operation timed out."); };
+      eval
+      {
+        alarm(sql_operation_timeout);
+
+        $sth = $dbh->prepare($main_data->{'sql_voicemail_recording'} =~ s/\s+/ /gr)
+          or &err(__LINE__, 'SQL Server | ' . DBI->errstr());
+
+        $sth->execute
+          (
+            $url_params[0]
+          )
+          or &err(__LINE__, 'SQL Server | ' . DBI->errstr());
+
+        $rows = $sth->rows;
+
+        (
+          $recordingMedia,
+          $recordingMediaName,
+          $recordingMediaMimeType
+        )
+        = $sth->fetchrow_array();
+
+        $sth->finish;
+      };
+
+      &err(__LINE__, 'SQL Server' . (($@ !~ /^$/) ? " | $@" : '')) if $@;
+      alarm(0);
+    };
+
+    &err(__LINE__, 'SQL Server' . (($@ !~ /^$/) ? " | $@" : '')) if $@;
+    eval { $dbh->disconnect() } if defined $dbh;
+
+    if ($rows == 0)
+    {
+      print &cgi_header(403, 'text/plain; charset=UTF-8') . http_403_response;
+      &log('ERROR', 'Web Client | URL query parameter(s) mismatch - ' . $url_params[0]);
+      exit 1;
+    }
+
+    my $audio = decode_base64($recordingMedia);
+
+    {
+      use bytes;
+      binmode(STDOUT, ':raw');
+      print &cgi_header(200, $recordingMediaMimeType . '; charset=ASCII', 
+        [
+          'Content-Length'      => length($audio),
+          'Content-Disposition' => $recordingMediaName ? 'attachment; filename="' . $recordingMediaName . '"' : 'inline'
+        ]) . $audio;
+    }
+
+    &log('VOICE', 'Web Client | Voicemail recording retrieval (' . $url_params[0] . ')');
+
+    exit 0;
+  }
+}
+
+if (!defined $cgi->param())
+{
+  print &cgi_header(403, 'text/plain; charset=UTF-8') . http_403_response;
+  &log('ERROR', 'Web Client | Cannot obtain any POST parameter');
+  exit 1;
+}
+
+my @params = defined $cgi->param() ? $cgi->param() : ();
+my ($contentType, $boundary) = $ENV{'CONTENT_TYPE'} =~ /^([^;]+); boundary=(-+[0-9a-f]+)$/;
+my $postdata;
+
+if (!($contentType && $boundary && ($#params == 0) && ($params[0] =~ /^POSTDATA$/) && (($postdata = (scalar $cgi->param('POSTDATA'))) =~ /^-*$boundary\r?$/m)))
+{
+  if (!(('AccountSid' ~~ @params) && ('CallSid' ~~ @params) && ('To' ~~ @params) && ('From' ~~ @params)))
+  {
+    print &cgi_header(403, 'text/plain; charset=UTF-8') . http_403_response;
+    &log('ERROR', 'Web Client | Invalid POST parameter(s)');
+    exit 1;
+  }
+
+  if (('CallStatus' ~~ @params) && ((scalar $cgi->param('CallStatus')) !~ /queued/i))
+  {
+    print &cgi_header(200, 'text/plain; charset=UTF-8') . http_200_response;
+    exit 0;
+  }
+
+  my $cgi__param__Called = scalar $cgi->param('Called') // scalar $cgi->param('To');
+
+  if (($cgi__param__Called eq scalar $cgi->param('To')) && ('SipHeader_Diversion' ~~ @params))
+  {
+    $cgi__param__Called = $1 if (scalar $cgi->param('SipHeader_Diversion')) =~ /<(?:tel|sip):(\+\d+)/i;
+  }
+
+  # voice routing
+
+  $dbh = DBI->connect('DBI:mysql:' . mysql_database, mysql_username, mysql_password, { RaiseError => 0, AutoCommit => 1 })
+    or &err(__LINE__, 'SQL Server | ' . DBI->errstr());
+
+  my (
+       $sth,
+       $rows,
+       $rid,
+       $accountStatus,
+       $numberStatus,
+       $numberService,
+       $numberDestination,
+       $routingService,
+       $routingDestination,
+       $voicemailGreetingPause,
+       $voicemailGreetingOrder,
+       $voicemailGreetingAudioMediaExists,
+       $voicemailGreetingAudioMediaMimeType,
+       $voicemailGreetingText,
+       $voicemailGreetingTextVoice,
+       $voicemailGreetingTextLanguage,
+       $voicemailRecording,
+       $voicemailRecordingBeep,
+       $voicemailRecordingMaxLength,
+       $voicemailRecordingTimeout,
+       $voicemailRecordingTrim,
+       $voicemailRecipientEmailAddress
+     );
+
+  eval
+  {
+    local $SIG{ALRM} = sub { &die(__LINE__, "SQL operation timed out."); };
+    eval
+    {
+      alarm(sql_operation_timeout);
+
+      $sth = $dbh->prepare($main_data->{'sql_voice_routing'} =~ s/\s+/ /gr)
+        or &err(__LINE__, 'SQL Server | ' . DBI->errstr());
+
+      $sth->execute
+        (
+          scalar $cgi->param('From'),
+          scalar $cgi->param('To'),
+                 $cgi__param__Called
+        )
+        or &err(__LINE__, 'SQL Server | ' . DBI->errstr());
+
+      $rows = $sth->rows;
+
+      (
+        $rid,
+        $accountStatus,
+        $numberStatus,
+        $numberService,
+        $numberDestination,
+        $routingService,
+        $routingDestination,
+        $voicemailGreetingPause,
+        $voicemailGreetingOrder,
+        $voicemailGreetingAudioMediaExists,
+        $voicemailGreetingAudioMediaMimeType,
+        $voicemailGreetingText,
+        $voicemailGreetingTextVoice,
+        $voicemailGreetingTextLanguage,
+        $voicemailRecording,
+        $voicemailRecordingBeep,
+        $voicemailRecordingMaxLength,
+        $voicemailRecordingTimeout,
+        $voicemailRecordingTrim,
+        $voicemailRecipientEmailAddress
+      )
+      = $sth->fetchrow_array();
+
+      $sth->finish;
+    };
+
+    &err(__LINE__, 'SQL Server' . (($@ !~ /^$/) ? " | $@" : '')) if $@;
+    alarm(0);
+  };
+
+  &err(__LINE__, 'SQL Server' . (($@ !~ /^$/) ? " | $@" : '')) if $@;
+
+  $voicemailGreetingText //= '';
+
+  my ($response, $destination) = ('busy', undef);
+
+  if (  ( $rows == 1                          )                                                                                                 &&
+        (($accountStatus // '') =~ /enabled/  )                                                                                                 && 
+        ( $numberStatus         =~ /enabled/  )                                                                                                 &&
+      ! ( $numberService        =~ /fax/      )                                                                                                 &&
+      ! ( $numberService        =~ /busy/     )                                                                                                 &&
+      !(( $numberService        =~ /routing/  ) && (($routingService // 'busy') =~ /busy/))                                                     &&
+      !(( $numberService        =~ /diversion/)                                                 && (($numberDestination  // '') !~ /^\+\d+$/))  &&
+      !(( $numberService        =~ /routing/  ) && ( $routingService            =~ /diversion/) && (($routingDestination // '') !~ /^\+\d+$/)))
+  {
+    if (($numberService =~ /diversion/) || (($numberService =~ /routing/) && ($routingService =~ /diversion/)))
+    {
+      $response = 'diversion';
+      $destination = ($numberService =~ /diversion/) ? $numberDestination : $routingDestination;
+      $rid = undef;
+    }
+    elsif ((($numberService =~ /voicemail/) || (($numberService =~ /routing/) && ($routingService =~ /voicemail/)))   &&
+          !($voicemailRecording =~ /no/ && $voicemailGreetingText =~ /^\s*$/  && !$voicemailGreetingAudioMediaExists) &&
+           ($voicemailRecording =~ /no/ || Email::Valid->address($voicemailRecipientEmailAddress // '')))
+    {
+      $response = 'voicemail';
+    }
+  }
+  else
+  {
+    if (($rows != 1)  || ($accountStatus !~ /^enabled/) || ($numberStatus  !~ /^enabled/))
+    {
+      $response = 'rejection';
+    }
+    $rid = undef;
+  }
+
+  eval
+  {
+    local $SIG{ALRM} = sub { &die(__LINE__, "SQL operation timed out."); };
+    eval
+    {
+      alarm(sql_operation_timeout);
+
+      $sth = $dbh->prepare($main_data->{'sql_voice_log'} =~ s/\s+/ /gr)
+        or &err(__LINE__, 'SQL Server | ' . DBI->errstr());
+
+      $sth->execute
+        (
+          uc(scalar $cgi->param('CallSid')),
+          uc(scalar $cgi->param('AccountSid')),
+          defined($rid) ? uc($rid =~ s/\-/{ sprintf("%x", rand 16) }/gre) : undef,
+          scalar $cgi->param('From'),
+          scalar $cgi->param('To'),
+                 $cgi__param__Called,
+          $response,
+          $destination
+        )
+        or &err(__LINE__, 'SQL Server | ' . DBI->errstr());
+    };
+
+    &err(__LINE__, 'SQL Server' . (($@ !~ /^$/) ? " | $@" : '')) if $@;
+    alarm(0);
+  };
+
+  &err(__LINE__, 'SQL Server' . (($@ !~ /^$/) ? " | $@" : '')) if $@;
+
+  eval { $dbh->disconnect() } if defined $dbh;
+
+  if ($response =~ /rejection/)
+  {
+    print &cgi_header(200, 'text/plain; charset=UTF-8') .
+  
+      '<?xml version="1.0" encoding="UTF-8"?>' . "\n" .
+      '<Response>'                             . "\n" .
+      '  <Reject reason="rejected" />'         . "\n" .
+      '</Response>';
+
+    &log('VOICE', 
+         'Web Client | A call from ' . scalar $cgi->param('From') . ' to ' . $cgi__param__Called . 
+         (($cgi__param__Called eq scalar $cgi->param('To')) ? '' : (' (' . scalar $cgi->param('To') . ')')) . ' was rejected.');
+
+    exit 0;
+  }
+
+  if ($response =~ /diversion/)
+  {
+    print &cgi_header(200, 'text/plain; charset=UTF-8') .
+  
+      '<?xml version="1.0" encoding="UTF-8"?>'                                       . "\n" .
+      '<Response>'                                                                   . "\n" .
+      '  <Dial callerId="{{$}}">'  =~ s/\{\{\$\}\}/{ scalar $cgi->param('From') }/er . "\n" .
+      '    <Number>{{$}}</Number>' =~ s/\{\{\$\}\}/{ $destination }/er               . "\n" .
+      '  </Dial>'                                                                    . "\n" .
+      '</Response>';
+
+    &log('VOICE', 
+         'Web Client | A call from ' . scalar $cgi->param('From') . ' to ' . $cgi__param__Called . 
+         (($cgi__param__Called eq scalar $cgi->param('To')) ? '' : (' (' . scalar $cgi->param('To') . ')')) . ' was forwarder to ' . $destination . '.');
+
+    exit 0;
+  }
+
+  if ($response =~ /voicemail/)
+  {
+    my $url = ('http' . (((($ENV{HTTPS} // 'off') eq 'on') || (($ENV{REQUEST_SCHEME} // 'http') eq 'https')) ? 's' : '') . '://' . $ENV{SERVER_NAME} . $ENV{REQUEST_URI}) 
+            =~ s~[?#].*$~~r;
+    my $ext = &mimeTypeExtenstion($voicemailGreetingAudioMediaMimeType) // '';
+    my $cid = uc(scalar $cgi->param('CallSid'));
+
+    print &cgi_header(200, 'text/plain; charset=UTF-8') .
+
+      '<?xml version="1.0" encoding="UTF-8"?>'                                                              . "\n"   .
+      '<Response>'                                                                                          . "\n"   .
+
+      (!$voicemailGreetingPause ? '' :
+      '  <Pause length="{{$}}" />'                 =~ s~\{\{\$\}\}~{ $voicemailGreetingPause        }~er    . "\n" ) .
+
+      (!$voicemailGreetingAudioMediaExists || $voicemailGreetingOrder !~ /audio-text/ ? '' :
+      '  <Play prefetch="false">{{$}}</Play>'      =~ s~\{\{\$\}\}~{ $url . $ext . '?' . $cid       }~er    . "\n" ) .
+
+      ($voicemailGreetingText =~ /^\s*$/ ? '' :
+      '  <Say voice="{{$}}"'                       =~ s~\{\{\$\}\}~{ $voicemailGreetingTextVoice    }~er    .      (
+      '    language="{{$}}">'        =~ s~^\s*~ ~r =~ s~\{\{\$\}\}~{ $voicemailGreetingTextLanguage }~er  ) .      (
+      '    {{$}}</Say>'              =~ s~^\s*          \{\{\$\}\}~{ $voicemailGreetingText         }~erx ) . "\n" ) .
+
+      (!$voicemailGreetingAudioMediaExists || $voicemailGreetingOrder !~ /text-audio/ ? '' :
+      '  <Play prefetch="false">{{$}}</Play>'      =~ s~\{\{\$\}\}~{ $url . $ext . '?' . $cid       }~er    . "\n" ) .
+
+      ($voicemailRecording =~ /no/ ? '' :
+      '  <Record storageUrl="{{$}}"'               =~ s~\{\{\$\}\}~{ $url . '?' . $cid              }~er    .      (
+      '    timeout="{{$}}"'          =~ s~^\s*~ ~r =~ s~\{\{\$\}\}~{ $voicemailRecordingTimeout     }~er  ) .      (
+      '    maxLength="{{$}}"'        =~ s~^\s*~ ~r =~ s~\{\{\$\}\}~{ $voicemailRecordingMaxLength   }~er  ) .      (
+      '    playBeep="{{$}}"'         =~ s~^\s*~ ~r =~ s~\{\{\$\}\}~{ $voicemailRecordingBeep        }~er  ) .      (
+      '    trim="{{$}}" />'          =~ s~^\s*~ ~r =~ s~\{\{\$\}\}~{ $voicemailRecordingTrim        }~er  ) . "\n" ) .
+
+      '</Response>';
+
+    &log('VOICE', 
+         'Web Client | A call from ' . scalar $cgi->param('From') . ' to ' . $cgi__param__Called . 
+         (($cgi__param__Called eq scalar $cgi->param('To')) ? '' : (' (' . scalar $cgi->param('To') . ')')) . ' was forwarded to voicemail.');
+
+    exit 0;
+  }
+
+  {
+    print &cgi_header(200, 'text/plain; charset=UTF-8') .
+
+      '<?xml version="1.0" encoding="UTF-8"?>' . "\n" .
+      '<Response>'                             . "\n" .
+      '  <Reject reason="busy" />'             . "\n" .
+      '</Response>';
+
+    &log('VOICE', 
+         'Web Client | A call from ' . scalar $cgi->param('From') . ' to ' . $cgi__param__Called . 
+         (($cgi__param__Called eq scalar $cgi->param('To')) ? '' : (' (' . scalar $cgi->param('To') . ')')) . ' was answered with busy signal.');
+
+    exit 0;
+  }
+}
+else
+{
+  # voicemail recording
+
+  my ($state, $error, $data, $name) = (1, 0);
+
+  for my $line (split "\n", $postdata =~ s/^-*$boundary\r?\n//r)
+  {
+    given ($state) {
+
+      when (1) {
+                 $error = $_, last if $line !~ /^Content-Disposition: attachment; (.*)/;
+                 my %param = $1 =~ /([^; =]+)=\x22([^\x22; ]+)\x22/g;
+                 $name = $param{name};
+                 foreach (keys %param) { $data->{$name}{$_} = $param{$_} if !/^name$/; }
+                 $state++;
+               }
+
+      when (2) {
+                 $state++, $_++, continue if $line !~ /^(Content-.*?): ([^\r]*)/;
+                 $data->{$name}{-$1} = $2;
+               }
+
+      when (3) {
+                 $error = $_, last if $line !~ /^\r?$/;
+                 $state++;
+               }
+
+      when (4) {
+                 $state++, $_++, continue if $line =~ /^(-*)$boundary\1?\r?$/;
+                 $data->{$name}{data} .= ($data->{$name}{data} ? "\n" : "") . $line;
+               }
+
+      when (5) {
+                 $data->{$name}{data} =~ s/\r\z//;
+                 $state = ($line =~ /-\r?$/) ? 0 : 1;
+               }
+    }
+
+    last if $error;
+  }
+
+  my ($size, @ascii);
+
+  if ($error || (!defined $data) || (!exists  $data->{recorded_file}) || (!exists  $data->{recorded_file}{data}) ||
+     (!defined $data->{recorded_file}{filename}) || ($data->{recorded_file}{filename} !~ /\.wav$/i) ||
+     (!((($size) = $data->{recorded_file}{data} =~ /^RIFF(.{4})WAVEfmt /) && (@ascii = unpack("C*", $size)) &&
+     ((($ascii[3] << 24) + ($ascii[2] << 16) + ($ascii[1] << 8) + $ascii[0] + 8) == length($data->{recorded_file}{data})))))
+  {
+    print &cgi_header(403, 'text/plain; charset=UTF-8') . http_403_response;
+    &log('ERROR', 'Web Client | POSTDATA format mismatch');
+    exit 1;
+  }
+
+  if (!((defined $data->{laml_SESSION_ID}) && (defined $data->{laml_SESSION_ID}{data}) && ($ENV{'REQUEST_URI'} =~ /\?$data->{laml_SESSION_ID}{data}/i)) ||
+      !((defined $data->{channel_uuid   }) && (defined $data->{channel_uuid   }{data}) && ($ENV{'REQUEST_URI'} =~ /\?$data->{channel_uuid   }{data}/i)))
+  {
+    print &cgi_header(403, 'text/plain; charset=UTF-8') . http_403_response;
+    &log('ERROR', 'Web Client | Inaccurate POST parameter(s)');
+    exit 1;
+  }
+
+  print &cgi_header(200, 'text/plain; charset=UTF-8') . http_200_response;
+
+  my ($ffmpeg, $mp3) = (0, '');
+
+  close STDERR;
+  {
+    local *STDERR;
+    open STDERR, ">&=", 2;
+    run3('ffmpeg -hide_banner -nostats -loglevel fatal -i - -vn -ar 44100 -ac 1 -b:a 64k -f mp3 -',
+         \$data->{recorded_file}{data}, \$mp3, \undef, { binmode_stdin => ':raw', binmode_stdout => ':raw', return_if_system_error => 1 });
+    close STDERR;
+  }
+  open STDERR;
+  &tieSTDERR();
+
+  if ($? == -1 || $? & 0x7F || $? >> 8 || $@)
+  {
+    &log('ERROR', 'WAV-to-MP3 | Convertion failed' .
+      ($? == -1 ? ' - System exception' : ($? & 0x7F ? ' - Killed by signal ' . ($? & 0x7F) : ($? >> 8 ? ' - Error code ' . ($? >> 8) : ''))) .
+      ($@ ? " - $@" : ''));
+    $ffmpeg = 1;
+  }
+
+  $dbh = DBI->connect('DBI:mysql:' . mysql_database, mysql_username, mysql_password, { RaiseError => 0, AutoCommit => 1 })
+    or &err(__LINE__, 'SQL Server | ' . DBI->errstr());
+
+  my (
+       $sth,
+       $rows,
+       $mid,
+       $timestamp,
+       $from,
+       $to,
+       $called,
+       $recipient_name,
+       $recipient_email_address,
+       $locale,
+       $timezone,
+       $datetime_format,
+       $regex_list,
+       $mp3_email_type,
+       $mp3_email_subject,
+       $mp3_email_body,
+       $url_email_type,
+       $url_email_subject,
+       $url_email_body,
+       $err_email_type,
+       $err_email_subject,
+       $err_email_body
+     );
+
+  eval
+  {
+    local $SIG{ALRM} = sub { &die(__LINE__, "SQL operation timed out."); };
+    eval
+    {
+      alarm(sql_operation_timeout);
+
+      $sth = $dbh->prepare($main_data->{'sql_voicemail_delivery'} =~ s/\s+/ /gr)
+        or &err(__LINE__, 'SQL Server | ' . DBI->errstr());
+
+      $sth->execute
+        (
+          $ENV{'QUERY_STRING'}
+        )
+        or &err(__LINE__, 'SQL Server | ' . DBI->errstr());
+
+      $rows = $sth->rows;
+
+      (
+        $mid,
+        $timestamp,
+        $from,
+        $to,
+        $called,
+        $recipient_name,
+        $recipient_email_address,
+        $locale,
+        $timezone,
+        $datetime_format,
+        $regex_list,
+        $mp3_email_type,
+        $mp3_email_subject,
+        $mp3_email_body,
+        $url_email_type,
+        $url_email_subject,
+        $url_email_body,
+        $err_email_type,
+        $err_email_subject,
+        $err_email_body
+      )
+      = $sth->fetchrow_array();
+
+      $sth->finish;
+    };
+
+    &err(__LINE__, 'SQL Server' . (($@ !~ /^$/) ? " | $@" : '')) if $@;
+    alarm(0);
+  };
+
+  &err(__LINE__, 'SQL Server' . (($@ !~ /^$/) ? " | $@" : '')) if $@;
+
+  if ($rows == 0)
+  {
+    print &cgi_header(403, 'text/plain; charset=UTF-8') . http_403_response;
+    &log('ERROR', 'E-Mail API | Cannot obtain voicemail delivery information'); 
+    exit 1;
+  }
+
+  my ($email_type, $email_subject, $email_body, @email_attachments) = ($err_email_type, $err_email_subject // '', $err_email_body // '', ());
+  my %var;
+
+  if (!$ffmpeg)
+  {
+    my $recording_datetime = '';
+
+    eval
+    {
+      $recording_datetime = DateTime->from_epoch(epoch => strptime($timestamp, '%Y-%m-%d %H:%M:%S')->epoch)
+                                    ->set_time_zone('UTC'    )->strftime('%Y%m%d-%H%M%S-');
+      $recording_datetime = DateTime->from_epoch(epoch => strptime($timestamp, '%Y-%m-%d %H:%M:%S')->epoch)
+                                    ->set_time_zone($timezone)->strftime('%Y%m%d-%H%M%S-');
+    };
+
+    my $recording_name = 'voicemail-' . $recording_datetime . ($from =~ s/\D+//gr) . '-' . ($called =~ s/\D+//gr) . '.mp3';
+
+    eval
+    {
+      local $SIG{ALRM} = sub { &die(__LINE__, "SQL operation timed out."); };
+      eval
+      {
+        alarm(sql_operation_timeout);
+
+        $sth = $dbh->prepare($main_data->{'sql_recording_log'} =~ s/\s+/ /gr)
+          or &err(__LINE__, 'SQL Server | ' . DBI->errstr());
+
+        $sth->execute
+          (
+            $mid,
+            encode_base64($mp3),
+            $recording_name
+          )
+          or &err(__LINE__, 'SQL Server | ' . DBI->errstr());
+      };
+
+      &err(__LINE__, 'SQL Server' . (($@ !~ /^$/) ? " | $@" : '')) if $@;
+      alarm(0);
+    };
+
+    &err(__LINE__, 'SQL Server' . (($@ !~ /^$/) ? " | $@" : '')) if $@;
+
+    if (length($mp3) <= maximum_attachment_size)
+    {
+      ($email_type, $email_subject, $email_body) = ($mp3_email_type, $mp3_email_subject // '', $mp3_email_body // '');
+
+      push(@email_attachments, {
+                                 '@odata.type'  => '#microsoft.graph.fileAttachment',
+                                 'name'         => $recording_name,
+                                 'contentType'  => 'audio/mpeg',
+                                 'size'         => length($mp3),
+                                 'isInline'     => 'false',
+                                 'contentBytes' => encode_base64($mp3),
+                               });
+    }
+    else
+    {
+      ($email_type, $email_subject, $email_body) = ($url_email_type, $url_email_subject // '', $url_email_body // '');
+    }
+  }
+
+  eval { $dbh->disconnect() } if defined $dbh;
+
+  my $datetime = $timestamp;
+  eval
+  {
+    $datetime = DateTime::Format::Strptime
+                  ->new(locale => 'en_US', pattern => '%A %b-%d-%Y, %H:%M:%S')
+                  ->format_datetime(DateTime->from_epoch(epoch => strptime($timestamp, '%Y-%m-%d %H:%M:%S')->epoch)
+                  ->set_time_zone('UTC'));
+    $datetime = DateTime::Format::Strptime
+                  ->new(locale => $locale, pattern => $datetime_format)
+                  ->format_datetime(DateTime->from_epoch(epoch => strptime($timestamp, '%Y-%m-%d %H:%M:%S')->epoch)
+                  ->set_time_zone($timezone));
+  };
+
+  $var{'FROM'     } = $from;
+  $var{'TO'       } = ($to eq $called) ? '' : $to;
+  $var{'CALLED'   } = $called;
+  $var{'DATETIME' } = $datetime;
+  $var{'FULLNAME' } = $recipient_name // '';
+  $var{'FIRSTNAME'} = ($recipient_name // '') =~ s/^\s*(\S+).*$/$1/r;
+  $var{'YEAR'     } = Time::Piece->new()->year;
+
+  $var{'MEDIA_URL'} = 
+    ('http' . (((($ENV{HTTPS} // 'off') eq 'on') || (($ENV{REQUEST_SCHEME} // 'http') eq 'https')) ? 's' : '') . '://' . $ENV{SERVER_NAME} . $ENV{REQUEST_URI})
+    =~ s~[?#].*$~~r . '.mp3?' . $mid;
+
+  # Examples of $regex_list item: phone_number ^\10000000000$ a\x20restricted\x20number
+  #                               phone_number ^\+1([0-9]{3})([0-9]{3})([0-9]{4})$ \($1\)\xA0$2\u2013$3
+
+  foreach (grep defined, map { /^([^ ]+) ([^ ]+) ([^ ]+)$/ ? [$1, $2, $3] : undef } split(/\s*[\n\r][\s\n\r]*/, ($regex_list //= '') =~ s/^[\s\n\r]+|[\s\n\r]+$//gsr))
+  {
+    $var{'FROM'  } = &regex_replace($var{'FROM'  }, $_->[1], $_->[2]) if (defined $_->[0] && $_->[0] eq 'phone_number' && defined $_->[1] && defined $_->[2]);
+    $var{'TO'    } = &regex_replace($var{'TO'    }, $_->[1], $_->[2]) if (defined $_->[0] && $_->[0] eq 'phone_number' && defined $_->[1] && defined $_->[2]);
+    $var{'CALLED'} = &regex_replace($var{'CALLED'}, $_->[1], $_->[2]) if (defined $_->[0] && $_->[0] eq 'phone_number' && defined $_->[1] && defined $_->[2]);
+  }
+
+  if ($email_type =~ /^HTML$/i)
+  {
+    $var{'FROM'  } = $var{'FROM'  } =~ s/(.)/<span>$1<\/span>/gr =~ s/^(.*)$/<span style="white-space: nowrap;">$1<\/span>/r if $var{'FROM'  } !~ /a-z/i; 
+    $var{'TO'    } = $var{'TO'    } =~ s/(.)/<span>$1<\/span>/gr =~ s/^(.*)$/<span style="white-space: nowrap;">$1<\/span>/r if $var{'TO'    } !~ /a-z/i;
+    $var{'CALLED'} = $var{'CALLED'} =~ s/(.)/<span>$1<\/span>/gr =~ s/^(.*)$/<span style="white-space: nowrap;">$1<\/span>/r if $var{'CALLED'} !~ /a-z/i;
+  }
+
+  $email_subject                       =~ s/\%\[\[(.*?)\]\]\%/{ &template_var_replace([template_variables], \%var, $1) }/seg ;
+  $email_body    = ($email_body // '') =~ s/\%\[\[(.*?)\]\]\%/{ &template_var_replace([template_variables], \%var, $1) }/segr;
+
+  my $ua = LWP::UserAgent->new(protocols_allowed => [ 'http', 'https' ], agent => web_agent, timeout => web_operation_timeout);
+
+  eval {
+    local $SIG{ALRM} = sub { &die(__LINE__, "Web operation timed out."); };
+    eval {
+      alarm(web_operation_timeout);
+
+      my $web;
+
+      $web = $ua->request(&http_request('POST', ms_graph_get_token_url,
+                                        [],
+                                        [
+                                          'client_id'     =>  ms_graph_client_id,
+                                          'scope'         =>  ms_graph_scope_url,
+                                          'client_secret' =>  ms_graph_client_secret,
+                                          'grant_type'    => 'client_credentials'
+                                        ]));
+      my $token = '';
+
+      eval { 
+        $token = decode_json($web->content)->{'access_token'} // '';
+      };
+      &err(__LINE__, 'E-Mail API | Cannot obtain Microsoft Graph access token') if $@ || $token =~ /^$/;
+
+      my $email = {
+                    'saveToSentItems'    =>  'false',
+                    'message'            =>
+                    {
+                      'from'             =>
+                      {
+                        'emailAddress'   =>
+                        {
+                          'address'      =>   ms_graph_email_address
+                        }
+                      },
+                      'toRecipients'     =>
+                      [
+                        {
+                          'emailAddress' =>
+                          {
+                            'name'       =>  $recipient_name // '',
+                            'address'    =>  $recipient_email_address // ''
+                          }
+                        }
+                      ],
+                      'subject'          =>  $email_subject,
+                      'body'             =>
+                      {
+                        'contentType'    =>  $email_type,
+                        'content'        =>  $email_body
+                      },
+                      'attachments'      => \@email_attachments
+                    }
+                  };
+
+      $web = $ua->request(&http_request('POST', ms_graph_send_mail_url,
+                                        [
+                                          'Authorization' => 'Bearer ' . $token,
+                                          'Content-Type'  => 'application/json; charset=UTF-8'
+                                        ],
+                                        encode_utf8(encode_json($email))));
+
+      &err(__LINE__, 'E-Mail API | Sendmail failed') if ($web->status_line !~ /^202\b/);
+    };
+
+    &err(__LINE__, 'E-Mail API | Microsoft Graph Email API failed') if $@;
+    alarm(0);
+  };
+
+  &err(__LINE__, 'E-Mail API | Microsoft Graph Email API failed') if $@;
+
+  exit 0;
+}
+
+__DATA__
+
+@sql_voicemail_greeting
+
+SELECT
+                `voicemails`.`greetingAudioMedia`,
+                `voicemails`.`greetingAudioMediaMimeType`
+FROM
+  ( SELECT
+                      `logs`.`from`,
+                      `logs`.`to`,
+                      `logs`.`called`
+    FROM
+                      `logs`
+    WHERE
+                      `logs`.`response` = "voicemail" AND
+                      `logs`.`cid` = ?
+  ) AS
+                      `logs`
+  LEFT JOIN
+  ( SELECT
+                   `numbers`.`number`,
+                   `numbers`.`service`
+    FROM
+                   `numbers`
+    WHERE
+                   `numbers`.`status` = "enabled"
+  ) AS
+                   `numbers`
+  ON
+                   `numbers`.`number` = `logs`.`to`
+  LEFT JOIN
+  ( SELECT
+                `voicemails`.`from`,
+                `voicemails`.`number`,
+                `voicemails`.`called`,
+                `voicemails`.`greetingAudioMedia`,
+                `voicemails`.`greetingAudioMediaMimeType`
+    FROM
+                `voicemails`
+    WHERE
+                `voicemails`.`status` = "enabled"
+  ) AS
+                `voicemails`
+  ON
+                `voicemails`.`number`  = `logs`.`to` AND
+             (((`voicemails`.`from`    = `logs`.`from`   OR `voicemails`.`from`   IS NULL OR `voicemails`.`from`   = "") AND
+               (`voicemails`.`called`  = `logs`.`called` OR `voicemails`.`called` IS NULL OR `voicemails`.`called` = "") AND
+                   `numbers`.`service` = "routing") OR
+               (`voicemails`.`from`   IS NULL AND
+                `voicemails`.`called` IS NULL AND
+                   `numbers`.`service` = "voicemail"))
+ORDER BY
+                IF(ISNULL(`voicemails`.`called`), 1, 0), IF(ISNULL(`voicemails`.`from`), 1, 0), `voicemails`.`called`, `voicemails`.`from`
+LIMIT 1
+
+@sql_voicemail_recording
+
+SELECT
+                `recordings`.`media`,
+                `recordings`.`mediaName`,
+                `recordings`.`mediaMimeType`
+FROM
+                `recordings`
+WHERE
+                `recordings`.`mid` = ?
+
+@sql_voice_routing
+
+SELECT
+                              UUID(),
+                  `accounts`.`status`,
+                   `numbers`.`status`,
+                   `numbers`.`service`,
+                   `numbers`.`destination`,
+                  `routings`.`service`,
+                  `routings`.`destination`,
+                `voicemails`.`greetingPause`,
+                `voicemails`.`greetingOrder`,
+                `voicemails`.`greetingAudioMediaExists`,
+                `voicemails`.`greetingAudioMediaMimeType`,
+                `voicemails`.`greetingText`,
+                `voicemails`.`greetingTextVoice`,
+                `voicemails`.`greetingTextLanguage`,
+                `voicemails`.`recording`,
+                `voicemails`.`recordingBeep`,
+                `voicemails`.`recordingMaxLength`,
+                `voicemails`.`recordingTimeout`,
+                `voicemails`.`recordingTrim`,
+                `voicemails`.`recipientEmailAddress`
+FROM
+  ( SELECT
+                 @from   := ?,
+                 @to     := ?,
+                 @called := ?
+  ) AS
+                      `temp`
+  INNER JOIN
+  ( SELECT
+                   `numbers`.`number`,
+                   `numbers`.`aid`,
+                   `numbers`.`status`,
+                   `numbers`.`service`,
+                   `numbers`.`destination`
+    FROM
+                   `numbers`
+    WHERE
+                   `numbers`.`number` = @to
+  ) AS
+                   `numbers`
+  LEFT JOIN
+  ( SELECT
+                  `accounts`.`aid`,
+                  `accounts`.`status`
+    FROM
+                  `accounts`
+  ) AS
+                  `accounts`
+  ON
+                  `accounts`.`aid` = `numbers`.`aid`
+  LEFT JOIN
+  ( SELECT
+                  `routings`.`from`,
+                  `routings`.`to`,
+                  `routings`.`called`,
+                  `routings`.`service`,
+                  `routings`.`destination`
+    FROM
+                  `routings`
+    WHERE
+                  `routings`.`status` = "enabled" AND
+                 (`routings`.`from`   = @from   OR `routings`.`from`   IS NULL OR `routings`.`from`   = "") AND
+                 (`routings`.`called` = @called OR `routings`.`called` IS NULL OR `routings`.`called` = "")
+    ORDER BY
+                  IF(ISNULL(`routings`.`called`), 1, 0), IF(ISNULL(`routings`.`from`), 1, 0), `routings`.`called`, `routings`.`from`
+    LIMIT 1
+  ) AS
+                  `routings`
+  ON
+                  `routings`.`to` = `numbers`.`number`
+  LEFT JOIN
+  ( SELECT
+                `voicemails`.`number`,
+                `voicemails`.`from`,
+                `voicemails`.`called`,
+                `voicemails`.`greetingPause`,
+                `voicemails`.`greetingOrder`,
+                `voicemails`.`greetingAudioMedia` IS NOT NULL AS `greetingAudioMediaExists`,
+                `voicemails`.`greetingAudioMediaMimeType`,
+                `voicemails`.`greetingText`,
+                `voicemails`.`greetingTextVoice`,
+                `voicemails`.`greetingTextLanguage`,
+                `voicemails`.`recording`,
+                `voicemails`.`recordingBeep`,
+                `voicemails`.`recordingMaxLength`,
+                `voicemails`.`recordingTimeout`,
+                `voicemails`.`recordingTrim`,
+                `voicemails`.`recipientEmailAddress`
+    FROM
+                `voicemails`
+    WHERE
+                `voicemails`.`status` = "enabled"
+  ) AS
+                `voicemails`
+  ON
+                `voicemails`.`number`  = `numbers`.`number` AND
+             (((`voicemails`.`from`    = @from   OR `voicemails`.`from`   IS NULL OR `voicemails`.`from`   = "") AND
+               (`voicemails`.`called`  = @called OR `voicemails`.`called` IS NULL OR `voicemails`.`called` = "") AND
+                   `numbers`.`service` = "routing") OR
+               (`voicemails`.`from`   IS NULL AND
+                `voicemails`.`called` IS NULL AND
+                   `numbers`.`service` = "voicemail"))
+ORDER BY
+                IF(ISNULL(`voicemails`.`called`), 1, 0), IF(ISNULL(`voicemails`.`from`), 1, 0), `voicemails`.`called`, `voicemails`.`from`
+LIMIT 1
+
+@sql_voice_log
+
+INSERT
+INTO 
+                      `logs`
+          (
+                      `logs`.`cid`,
+                      `logs`.`aid`,
+                      `logs`.`mid`,
+                      `logs`.`from`,
+                      `logs`.`to`,
+                      `logs`.`called`,
+                      `logs`.`response`,
+                      `logs`.`destination`
+          )
+VALUES
+          (
+                      ?,
+                      ?,
+                      ?,
+                      ?,
+                      ?,
+                      ?,
+                      ?,
+                      ?
+          )
+
+@sql_voicemail_delivery
+
+SELECT
+                      `logs`.`mid`,
+                      `logs`.`timestamp`,
+                      `logs`.`from`,
+                      `logs`.`to`,
+                      `logs`.`called`,
+                `voicemails`.`recipientName`,
+                `voicemails`.`recipientEmailAddress`,
+                `voicemails`.`locale`,
+                `voicemails`.`timezone`,
+                `voicemails`.`datetimeFormat`,
+                `voicemails`.`regexList`,
+                `voicemails`.`mp3_emailType`,
+                `voicemails`.`mp3_emailSubject`,
+                `voicemails`.`mp3_emailBody`,
+                `voicemails`.`url_emailType`,
+                `voicemails`.`url_emailSubject`,
+                `voicemails`.`url_emailBody`,
+                `voicemails`.`err_emailType`,
+                `voicemails`.`err_emailSubject`,
+                `voicemails`.`err_emailBody`
+FROM
+  ( SELECT
+                      `logs`.`mid`,
+                      `logs`.`timestamp`,
+                      `logs`.`from`,
+                      `logs`.`to`,
+                      `logs`.`called`
+    FROM
+                      `logs`
+    WHERE
+                      `logs`.`response` = "voicemail" AND
+                      `logs`.`cid` = ?
+  ) AS
+                      `logs`
+  LEFT JOIN
+  ( SELECT
+                   `numbers`.`number`,
+                   `numbers`.`service`
+    FROM
+                   `numbers`
+    WHERE
+                   `numbers`.`status` = "enabled"
+  ) AS
+                   `numbers`
+  ON
+                   `numbers`.`number` = `logs`.`to`
+  LEFT JOIN
+  ( SELECT
+                `voicemails`.`from`,
+                `voicemails`.`number`,
+                `voicemails`.`called`,
+                `voicemails`.`recipientName`,
+                `voicemails`.`recipientEmailAddress`,
+                `voicemails`.`locale`,
+                `voicemails`.`timezone`,
+                `voicemails`.`datetimeFormat`,
+                `voicemails`.`regexList`,
+                `voicemails`.`mp3_emailType`,
+                `voicemails`.`mp3_emailSubject`,
+                `voicemails`.`mp3_emailBody`,
+                `voicemails`.`url_emailType`,
+                `voicemails`.`url_emailSubject`,
+                `voicemails`.`url_emailBody`,
+                `voicemails`.`err_emailType`,
+                `voicemails`.`err_emailSubject`,
+                `voicemails`.`err_emailBody`
+    FROM
+                `voicemails`
+    WHERE
+                `voicemails`.`status` = "enabled"
+  ) AS
+                `voicemails`
+  ON
+                `voicemails`.`number`  = `logs`.`to` AND
+             (((`voicemails`.`from`    = `logs`.`from`   OR `voicemails`.`from`   IS NULL OR `voicemails`.`from`   = "") AND
+               (`voicemails`.`called`  = `logs`.`called` OR `voicemails`.`called` IS NULL OR `voicemails`.`called` = "") AND
+                   `numbers`.`service` = "routing") OR
+               (`voicemails`.`from`   IS NULL AND
+                `voicemails`.`called` IS NULL AND
+                   `numbers`.`service` = "voicemail"))
+ORDER BY
+                IF(ISNULL(`voicemails`.`called`), 1, 0), IF(ISNULL(`voicemails`.`from`), 1, 0), `voicemails`.`called`, `voicemails`.`from`
+LIMIT 1
+
+@sql_recording_log
+
+INSERT
+INTO 
+                `recordings`
+          (
+                `recordings`.`mid`,
+                `recordings`.`media`,
+                `recordings`.`mediaName`,
+                `recordings`.`mediaMimeType`
+          )
+VALUES
+          (
+                      ?,
+                      ?,
+                      ?,
+                      'audio/mpeg'
+          )
