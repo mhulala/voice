@@ -23,7 +23,7 @@ The application written in **Perl** was tested on Linux machines with the suppor
 
 Indeed, the configuration can be modified to your needs. My script does not use a .pl extension, so in .htaccess, it was necessary to set files without extension as CGI scripts. The second part of the .htaccess configuration redirects related audio files to the script.
 
-I use Microsoft Graph API to send an email message with recorded voicemail to set the recipient. Similarly to database credentials, Microsoft Graph credentials have to be entered into the code: 
+I use **Microsoft Graph** API to send an email message with recorded voicemail to set the recipient. Similarly to database credentials, Microsoft Graph credentials have to be entered into the code: 
 
     use constant mysql_database          => '##########';
     use constant mysql_username          => '##########';
