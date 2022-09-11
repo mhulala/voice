@@ -1165,7 +1165,7 @@ else
   &err(__LINE__, 'E-Mail API | Microsoft Graph Email API failed') if $@;
 
   exit 0;
-}
+} 
 
 __DATA__
 
