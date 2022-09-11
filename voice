@@ -209,8 +209,6 @@ use constant ms_graph_scope_url      => 'https://graph.microsoft.com/.default';
 use constant ms_graph_get_token_url  => 'https://login.microsoftonline.com/##########/oauth2/v2.0/token';
 use constant ms_graph_send_mail_url  => 'https://graph.microsoft.com/v1.0/users/##########/sendmail';
 
-#-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------#
-
 $ENV{'PERL_LWP_SSL_VERIFY_HOSTNAME'} = 0;
 
 my $main_data;
